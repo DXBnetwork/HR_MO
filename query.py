@@ -1,5 +1,6 @@
 import os
 import uuid
+import asyncio
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from llama_index.core import VectorStoreIndex
@@ -12,6 +13,13 @@ from langchain_groq import ChatGroq
 from llama_index.core.agent.workflow import ReActAgent
 from outlooktool import make_search_tool, email_tool
 load_dotenv()
+
+try:
+    from ragas.metrics import Faithfulness, AnswerRelevancy
+    from ragas import evaluate, EvaluationDataset, SingleTurnSample
+    RAGAS_AVAILABLE = True
+except ImportError:
+    RAGAS_AVAILABLE = False
 
 logger = init_logger(project="My Project")
 
@@ -27,11 +35,11 @@ index = VectorStoreIndex.from_vector_store(
 )
 
 llm = Groq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
-evaluator_llm = ChatGroq(
+ragas_llm = ChatGroq(
     model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"]
 )
 
-# Session store: session_id -> (memory, chat_engine)
+# Session store: session_id -> (memory, agent, session_state)
 sessions: dict = {}
 
 
@@ -53,6 +61,7 @@ def get_or_create_session(session_id: str):
                     "If a question is outside the scope of HR policies, offer to email HR directly. "
                     "If the user asks to send an email to HR, you must call the send_email tool immediately using the drafted content. "
                     "Do not write out the email as a response, call the tool. "
+                    "Always include citations from the search tool in your final answer. "
                     "The HR email address is hr@murrayosorio.com."
                 ),
                 priority=0,
@@ -60,59 +69,51 @@ def get_or_create_session(session_id: str):
         ],
     )
 
-    chat_engine = index.as_chat_engine(
+    query_engine = index.as_query_engine(
         llm=llm,
-        memory=memory,
-        chat_mode="context",
+        similarity_top_k=5,
     )
 
-    sessions[session_id] = (memory, chat_engine)
-    return memory, chat_engine
+    session_state = {"citations": []}
+
+    def save_citations(citations):
+        session_state["citations"] = citations
+
+    search_tool = make_search_tool(query_engine, save_citations=save_citations)
+    agent = ReActAgent(
+        tools=[search_tool, email_tool],
+        llm=llm,
+        verbose=True,
+    )
+
+    sessions[session_id] = (memory, agent, session_state)
+    return memory, agent, session_state
 
 
-def evaluate_faithfulness(answer: str, contexts: list) -> float:
-    context_text = "\n\n".join(contexts[:3])
-    prompt = f"""You are evaluating if an answer is grounded in the provided context.
-Context:
-{context_text}
-Answer:
-{answer}
-Is the answer faithful to the context? Score from 0.0 to 1.0 where:
-- 0.0 = completely made up, not in context at all
-- 0.5 = partially grounded, some claims not in context
-- 1.0 = fully grounded, all claims supported by context
-Respond with ONLY a number between 0.0 and 1.0, nothing else."""
+def evaluate_with_ragas(question: str, answer: str, contexts: list[str]) -> tuple[float, float]:
+    if not RAGAS_AVAILABLE:
+        print("RAGAS is not installed. Install it with: pip install ragas")
+        return 0.5, 0.5
+
     try:
-        response = evaluator_llm.invoke(prompt)
-        score = float(response.content.strip())
-        return max(0.0, min(1.0, score))
-    except:
-        return 0.5
-
-
-def evaluate_relevancy(question: str, answer: str, contexts: list) -> float:
-    context_text = "\n\n".join(contexts[:3])
-    prompt = f"""You are evaluating if an answer properly addresses the question using the provided context.
-Context:
-{context_text}
-Question:
-{question}
-Answer:
-{answer}
-Evaluate two things:
-1. Does the answer directly address what the question is asking?
-2. Is the answer using information from the context (not making things up)?
-Score from 0.0 to 1.0 where:
-- 0.0 = irrelevant OR not grounded in context
-- 0.5 = somewhat addresses question but incomplete or partially made up
-- 1.0 = directly answers question using only context
-Respond with ONLY a number between 0.0 and 1.0, nothing else."""
-    try:
-        response = evaluator_llm.invoke(prompt)
-        score = float(response.content.strip())
-        return max(0.0, min(1.0, score))
-    except:
-        return 0.5
+        sample = SingleTurnSample(
+            user_input=question,
+            response=answer,
+            retrieved_contexts=contexts,
+        )
+        dataset = EvaluationDataset(samples=[sample])
+        results = evaluate(
+            dataset=dataset,
+            metrics=[Faithfulness(), AnswerRelevancy()],
+            llm=ragas_llm,
+        )
+        row = results.to_pandas().iloc[0]
+        faithfulness = float(row.get("faithfulness", 0.5))
+        relevancy = float(row.get("answer_relevancy", 0.5))
+        return max(0.0, min(1.0, faithfulness)), max(0.0, min(1.0, relevancy))
+    except Exception as exc:
+        print(f"RAGAS evaluation failed: {exc}")
+        return 0.5, 0.5
 
 
 def ask_question(query: str, session_id: str = None):
@@ -121,33 +122,45 @@ def ask_question(query: str, session_id: str = None):
         session_id = str(uuid.uuid4())
         print(f"New session started: {session_id}")
 
-    memory, chat_engine = get_or_create_session(session_id)
+    memory, agent, session_state = get_or_create_session(session_id)
 
     print(f"\n{'='*60}")
     print(f"Session: {session_id}")
     print(f"Question: {query}")
     print(f"{'='*60}\n")
 
-    response = chat_engine.chat(query)
-    result = str(response)
-    contexts = [node.text for node in response.source_nodes]
+    async def run_agent():
+        session_state["citations"] = []
+        response = await agent.run(user_msg=query, memory=memory)
+        return str(response)
+
+    result = asyncio.run(run_agent())
+    citations = session_state["citations"]
+    contexts = [c["snippet"] for c in citations if c.get("snippet")]
 
     print(f"Answer:\n{result}\n")
+    if citations:
+        print("Citations:")
+        for citation in citations:
+            page_text = f", page {citation['page']}" if citation.get("page") is not None else ""
+            print(f"[{citation['id']}] {citation['source']}{page_text}")
+        print()
+    else:
+        print("Citations: none\n")
 
     print("Evaluating...")
-    faithfulness = evaluate_faithfulness(result, contexts)
-    relevancy = evaluate_relevancy(query, result, contexts)  # fixed: pass contexts
+    faithfulness, relevancy = evaluate_with_ragas(query, result, contexts)
 
     print(f"{'='*60}")
     print(f"✅ Faithfulness: {faithfulness:.2f}")
     print(f"✅ Relevancy: {relevancy:.2f}")
-    print(f"📊 Retrieved {len(contexts)} context chunks")
+    print(f"📊 Retrieved {len(citations)} citations")
 
     logger.log(
         input={"query": query, "session_id": session_id},
         output={"response": result},
         scores={"faithfulness": faithfulness, "relevancy": relevancy},
-        metadata={"num_contexts": len(contexts), "status": "evaluated"},
+        metadata={"num_contexts": len(contexts), "num_citations": len(citations), "status": "evaluated"},
     )
     print("✅ Logged to Braintrust\n")
 

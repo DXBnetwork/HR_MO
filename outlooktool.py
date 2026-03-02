@@ -43,7 +43,33 @@ def send_email(subject: str, email_body: str, recipient: str = "hr@murrayosorio.
         return f"Failed to send email: {response.text}"
 
 
-def make_search_tool(query_engine):
+def _extract_citations(response) -> list[dict]:
+    citations = []
+    source_nodes = getattr(response, "source_nodes", []) or []
+
+    for idx, source_node in enumerate(source_nodes, start=1):
+        node = getattr(source_node, "node", None)
+        metadata = getattr(node, "metadata", {}) or {}
+        text = getattr(source_node, "text", "") or ""
+
+        citation = {
+            "id": idx,
+            "source": metadata.get("file_name")
+            or metadata.get("filename")
+            or metadata.get("document_id")
+            or "unknown",
+            "page": metadata.get("page_label")
+            or metadata.get("page_number")
+            or metadata.get("page"),
+            "score": getattr(source_node, "score", None),
+            "snippet": " ".join(text.split())[:240],
+        }
+        citations.append(citation)
+
+    return citations
+
+
+def make_search_tool(query_engine, save_citations=None):
     """
     Wraps the query engine as a search tool.
     Calls Pinecone directly, memory lives at the agent level.
@@ -61,7 +87,20 @@ def make_search_tool(query_engine):
             response = query_engine.chat(question)
         else:
             raise ValueError("Search tool expected an engine with .query() or .chat()")
-        return str(response)
+
+        citations = _extract_citations(response)
+        if save_citations is not None:
+            save_citations(citations)
+
+        if not citations:
+            return f"{str(response)}\n\nCitations: none"
+
+        citation_lines = []
+        for citation in citations:
+            page_text = f", page {citation['page']}" if citation["page"] is not None else ""
+            citation_lines.append(f"[{citation['id']}] {citation['source']}{page_text}")
+
+        return f"{str(response)}\n\nCitations:\n" + "\n".join(citation_lines)
 
     return FunctionTool.from_defaults(fn=search_hr_docs)
 

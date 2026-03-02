@@ -31,7 +31,7 @@ llm = Groq(
     api_key=os.environ["GROQ_API_KEY"]
 )
 
-# Session store: session_id -> (memory, agent)
+# Session store: session_id -> (memory, agent, session_state)
 sessions: dict = {}
 
 
@@ -50,7 +50,9 @@ def get_or_create_session(session_id: str):
                 static_content=(
                     "You are an HR assistant for Murray Osorio PLLC, an immigration law firm. "
                     "Answer questions about company policies, benefits, and procedures accurately. "
-                    "If a question is outside HR policy documents, offer to email HR directly."
+                    "If a question is outside HR policy documents, offer to email HR directly. "
+                    "If the user asks to send an email to HR, call the send_email tool. "
+                    "Always include citations from the search tool in your final answer."
                 ),
                 priority=0,
             )
@@ -62,7 +64,12 @@ def get_or_create_session(session_id: str):
         similarity_top_k=5,
     )
 
-    search_tool = make_search_tool(query_engine)
+    session_state = {"citations": []}
+
+    def save_citations(citations):
+        session_state["citations"] = citations
+
+    search_tool = make_search_tool(query_engine, save_citations=save_citations)
 
     agent = ReActAgent(
     tools=[search_tool, email_tool],
@@ -70,8 +77,8 @@ def get_or_create_session(session_id: str):
     verbose=True,
     )
 
-    sessions[session_id] = (memory, agent)
-    return memory, agent
+    sessions[session_id] = (memory, agent, session_state)
+    return memory, agent, session_state
 
 
 @app.route('/')
@@ -88,15 +95,16 @@ def query():
     if not question:
         return jsonify({'error': 'No question provided'}), 400
 
-    memory, agent = get_or_create_session(session_id)
+    memory, agent, session_state = get_or_create_session(session_id)
 
     async def run_agent():
+        session_state["citations"] = []
         response = await agent.run(user_msg=question, memory=memory)
-        return str(response)
+        return str(response), session_state["citations"]
 
     try:
-        answer = asyncio.run(run_agent())
-        return jsonify({'answer': answer, 'session_id': session_id})
+        answer, citations = asyncio.run(run_agent())
+        return jsonify({'answer': answer, 'session_id': session_id, 'citations': citations})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
