@@ -54,6 +54,8 @@
     </div>
 
     <script>
+        let sessionId = null;
+
         async function askQuestion() {
             const question = document.getElementById('question').value;
             if (!question) return;
@@ -66,10 +68,13 @@
             const response = await fetch('/query', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({question: question})
+                body: JSON.stringify({question: question, session_id: sessionId})
             });
 
             const data = await response.json();
+            if (data.session_id) {
+                sessionId = data.session_id;
+            }
             addMessage(data.answer, 'bot');
         }
 

@@ -69,7 +69,11 @@ def _extract_citations(response) -> list[dict]:
     return citations
 
 
-def make_search_tool(query_engine, save_citations=None):
+def extract_citations_from_response(response) -> list[dict]:
+    return _extract_citations(response)
+
+
+def make_search_tool(query_engine, save_citations=None, save_tool_event=None):
     """
     Wraps the query engine as a search tool.
     Calls Pinecone directly, memory lives at the agent level.
@@ -81,14 +85,37 @@ def make_search_tool(query_engine, save_citations=None):
         Args:
             question: The HR-related question to search for
         """
-        if hasattr(query_engine, "query"):
-            response = query_engine.query(question)
-        elif hasattr(query_engine, "chat"):
-            response = query_engine.chat(question)
-        else:
-            raise ValueError("Search tool expected an engine with .query() or .chat()")
+        event = {
+            "tool": "search_hr_docs",
+            "args_valid": bool(question and question.strip()),
+            "success": False,
+            "error": None,
+        }
+        if not event["args_valid"]:
+            event["error"] = "Missing required argument: question"
+            if save_tool_event is not None:
+                save_tool_event(event)
+            return "Search tool failed: question is required."
+
+        try:
+            if hasattr(query_engine, "query"):
+                response = query_engine.query(question)
+            elif hasattr(query_engine, "chat"):
+                response = query_engine.chat(question)
+            else:
+                raise ValueError("Search tool expected an engine with .query() or .chat()")
+        except Exception as exc:
+            event["error"] = str(exc)
+            if save_tool_event is not None:
+                save_tool_event(event)
+            return f"Search tool failed: {exc}"
 
         citations = _extract_citations(response)
+        event["success"] = True
+        event["num_citations"] = len(citations)
+
+        if save_tool_event is not None:
+            save_tool_event(event)
         if save_citations is not None:
             save_citations(citations)
 
@@ -105,4 +132,36 @@ def make_search_tool(query_engine, save_citations=None):
     return FunctionTool.from_defaults(fn=search_hr_docs)
 
 
-email_tool = FunctionTool.from_defaults(fn=send_email)
+def make_email_tool(save_tool_event=None):
+    def send_email_with_metrics(
+        subject: str,
+        email_body: str,
+        recipient: str = "hr@murrayosorio.com",
+    ) -> str:
+        event = {
+            "tool": "send_email",
+            "args_valid": bool(subject and subject.strip() and email_body and email_body.strip()),
+            "success": False,
+            "error": None,
+            "recipient": recipient,
+        }
+
+        if not event["args_valid"]:
+            event["error"] = "Missing required arguments: subject and email_body"
+            if save_tool_event is not None:
+                save_tool_event(event)
+            return "Email tool failed: subject and email_body are required."
+
+        result = send_email(subject=subject, email_body=email_body, recipient=recipient)
+        event["success"] = result.lower().startswith("email sent successfully")
+        if not event["success"]:
+            event["error"] = result
+
+        if save_tool_event is not None:
+            save_tool_event(event)
+        return result
+
+    return FunctionTool.from_defaults(fn=send_email_with_metrics)
+
+
+email_tool = make_email_tool()
